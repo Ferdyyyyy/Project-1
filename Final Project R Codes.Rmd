@@ -1,0 +1,680 @@
+---
+title: "Final Project: Data Analysis, Regression MAP535"
+author: "Honghao YU & Jiayu GAN"
+date: "12/20/2019"
+geometry: margin=2cm
+output: pdf_document
+fontsize: 10
+---
+
+
+**I. Introduction**
+
+
+In this project we seek to use linear regression model to quantify the relationship between house prices and a comprehensive list of features that describe the houses, as well as make accurate predictions for future sales. Among these features are the detailed conditions of the houses themselves (areas, facilities, style, well-being, ages, etc.) and the characteristics of their surroundings (neighborhood, access to main roads, etc.). We would like to test 1) whether these features are valid for prediction, i.e. whether their coefficients are statistically significantly different from 0, 2) which are the most significant and 3) how they impact house prices respectively revealed by their coefficients.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(DMwR)
+library(grid)
+library(carData)
+library(car)
+library(dplyr)
+library(tidyverse)
+library(caret)
+library(GGally)
+library(lattice)
+library(corrplot)
+library(magrittr)
+library(xgboost)
+library(RANN)
+library(mice)
+```
+
+```{r import data, include=FALSE}
+train <- read_csv(file = "train_raw.csv")
+#head(train)
+colSums(is.na(train))
+#names(train)
+```
+
+```{r set row names and drop the original ID, include=FALSE}
+row.names(train) <- train$Id
+train <- select(train, -Id)
+names(train)
+```
+
+
+**II. Exploratory Data Analysis**
+
+
+Before looking into the details, we performed a rough filtering to leave out problematic variables. We noticed that some categorical variables with a level “NA” for “No Such Thing” might be taken by R as missing values, thus we replaced “NA” by “Zero” before reading in the data. We then dropped variables with 20% or more missing entries and those with near-zero variance (for both numeric and factor variables) at the frequency cut of 90/10. For the remaining missing values, we performed knn-mean imputation for quantitative variables and most-frequent imputation for factor variables. Two variables were created to indicate the ages of the houses when sold since they were built and since they were last remodeled. We also transformed some supposedly factor variables that described qualities and conditions in an ordered fashion into ordinal numeric variables. These primary modifications being done, we performed a graphical analysis for the numeric variables as below:
+
+
+```{r, include=FALSE}
+# Manually pick out the categorical features which have 'NA' as 
+# a modality for the following treatment.
+groupNA <- c("Alley","BsmtQual","BsmtCond","BsmtExposure",
+             "BsmtFinType1","BsmtFinType2","FireplaceQu",
+             "GarageType","GarageYrBlt","GarageFinish",
+             "GarageQual","GarageCond",
+             "PoolQC","Fence","MiscFeature")
+trainA <- select(train, -groupNA)
+trainB <- select(train, SalePrice, groupNA)
+names(trainA)
+names(trainB)
+```
+
+```{r, include=FALSE}
+# Replace 'NA' by 'Zero' so it wouldn't be mistaken for 
+# missing values
+trainB[is.na(trainB)] <- "Zero"
+trainB$GarageYrBlt <- train$GarageYrBlt
+trainB
+```
+
+```{r filtering out problematic features 1, include=FALSE}
+# Set the threshold at 0.2. Drop features with 20% or more 
+# missing entries
+missing_threshold <- .2
+is_too_scarce <- map_lgl(select(trainA, -SalePrice), ~mean(is.na(.x)) > missing_threshold)
+not_too_scarce <- names(is_too_scarce)[!is_too_scarce]
+trainA <- select(trainA, SalePrice, not_too_scarce)
+names(trainA)
+colSums(is.na(trainA))
+```
+
+```{r, include=FALSE}
+# Investigate the data
+train_new <- cbind(trainA, select(trainB, -SalePrice))
+#head(train_new)
+colSums(is.na(train_new))
+sum(is.na(train_new$MasVnrType))
+```
+
+```{r feature creation 1, include=FALSE}
+# Creating three new features measuring the age of the house when sold
+# from different aspects.
+train_new$AgeSoldBuilt <- train_new$YrSold - train_new$YearBuilt
+train_new$AgeSoldRemod <- train_new$YrSold - train_new$YearRemodAdd
+train_new$AgeSoldGarage <- train_new$YrSold - train_new$GarageYrBlt
+colSums(is.na(train_new))
+sum(is.na(train_new$MasVnrType))
+```
+
+```{r feature transformation 1, include=FALSE}
+# Transform qualitative variables into factors
+var.quali <- sapply(select(train_new,-"SalePrice"), function(x) is.character(x))
+var.quali["MSSubClass"]=TRUE
+train_new %<>% mutate_each(funs(as.factor), names(var.quali)[var.quali])
+str(train_new)
+```
+
+```{r filtering out problematic features 2, include=FALSE}
+# Drop features with near-zero variance at the threshold of 90/10
+train_new <- select(train_new, -c(nearZeroVar(train_new, freqCut = 90/10)))
+var.factor <- sapply(select(train_new,-"SalePrice"), function(x) is.factor(x))
+set_factor <- select(train_new, names(var.factor)[var.factor])
+set_numerical <- select(train_new, -c(names(var.factor)[var.factor]))
+set_factor
+set_numerical
+```
+
+```{r imputation 1, include=FALSE}
+# For numerical variables, impute missing values using knn-means
+library(DMwR)
+library(grid)
+SalePrice <- set_numerical$SalePrice
+AgeSoldGarage <- set_numerical$AgeSoldGarage
+set_numerical <- cbind(SalePrice, knnImputation(select(set_numerical, -c(SalePrice, AgeSoldGarage))), AgeSoldGarage)
+colSums(is.na(set_numerical))
+```
+
+```{r imputation 2, include=FALSE}
+# For factor variables, impute with the mode
+set_factor <- map_df(set_factor, function(x) {
+    if (anyNA(x)) x[is.na(x)] <- names(which.max(table(x)))
+    x
+  }
+)
+colSums(is.na(set_factor))
+```
+
+```{r, include=FALSE}
+train_proprocessed <- cbind(set_numerical, set_factor)
+str(train_proprocessed)
+```
+
+```{r spliting the features, include=FALSE}
+# Manually split the features according to their characteristics
+group1 <- c("SalePrice", "LotFrontage", "LotArea", "MasVnrArea",
+            "BsmtFinSF1", "BsmtUnfSF", "TotalBsmtSF", "1stFlrSF",
+            "2ndFlrSF", "GrLivArea", "GarageArea", "WoodDeckSF", "OpenPorchSF")
+log_group1 <- paste("log", group1, sep="")
+group2 <- c("SalePrice", "OverallQual", "OverallCond", "BsmtFullBath", "FullBath",
+            "HalfBath", "BedroomAbvGr", "TotRmsAbvGrd", "Fireplaces", 
+            "GarageCars", "ExterQual", "ExterCond", "BsmtQual", 
+            "BsmtExposure", "BsmtFinType1", 
+            "KitchenQual", "FireplaceQu", 
+            "GarageFinish", "Fence", "AgeSoldBuilt", "AgeSoldRemod", "AgeSoldGarage")
+subset1 <- select(train_proprocessed, group1)
+subset2 <- select(train_proprocessed, group2)
+subset1_log <- map_df(subset1, function(x) {log(x+1)})
+colnames(subset1_log) <- log_group1
+subset3 <- select(train_proprocessed, -c(group1, group2))
+subset3 <- select(subset3, -c("YearBuilt","YearRemodAdd","YrSold","GarageYrBlt"))
+subset3 <- cbind(SalePrice, subset3)
+subset3$MoSold <- as.factor(subset3$MoSold)
+```
+
+```{r subsplit, include=FALSE}
+# Subslit group 2 into 2 subsets, one with ordinality and the other without.
+subset2.var.factor <- sapply(select(subset2,-"SalePrice"), function(x) is.factor(x))
+subset2.factor <- select(subset2, c(names(subset2.var.factor)[subset2.var.factor]))
+```
+
+```{r, include=FALSE}
+levels(subset2.factor$ExterQual)
+tabulate(subset2.factor$ExterQual)
+```
+
+```{r feature transformation 2, include=FALSE}
+# Transform factor variables with ordinality into numeric variables
+subset2$ExterQualN <- NA
+subset2$ExterCondN <- NA
+subset2$BsmtQualN <- NA
+subset2$BsmtExposureN <- NA
+subset2$BsmtFinType1N <- NA
+subset2$KitchenQualN <- NA
+subset2$FireplaceQuN <- NA
+subset2$GarageFinishN <- NA
+subset2$FenceN <- NA
+```
+
+```{r feature transformation 3, include=FALSE}
+# Assign values to the newly created ordinal numeric variables
+# Create dummy variables to indicate whether a specific part exists
+subset2[subset2$ExterQual == "Po", "ExterQualN"] <- 1
+subset2[subset2$ExterQual == "Fa", "ExterQualN"] <- 2
+subset2[subset2$ExterQual == "TA", "ExterQualN"] <- 3
+subset2[subset2$ExterQual == "Gd", "ExterQualN"] <- 4
+subset2[subset2$ExterQual == "Ex", "ExterQualN"] <- 5
+
+subset2[subset2$ExterCond == "Po", "ExterCondN"] <- 1
+subset2[subset2$ExterCond == "Fa", "ExterCondN"] <- 2
+subset2[subset2$ExterCond == "TA", "ExterCondN"] <- 3
+subset2[subset2$ExterCond == "Gd", "ExterCondN"] <- 4
+subset2[subset2$ExterCond == "Ex", "ExterCondN"] <- 5
+
+subset2[subset2$BsmtQual == "Zero", "BsmtQualN"] <- 0
+subset2[subset2$BsmtQual == "Po", "BsmtQualN"] <- 1
+subset2[subset2$BsmtQual == "Fa", "BsmtQualN"] <- 2
+subset2[subset2$BsmtQual == "TA", "BsmtQualN"] <- 3
+subset2[subset2$BsmtQual == "Gd", "BsmtQualN"] <- 4
+subset2[subset2$BsmtQual == "Ex", "BsmtQualN"] <- 5
+
+subset2$WithBsmt <- 0
+subset2[subset2$BsmtQualN > 0, "WithBsmt"] <- 1
+
+subset2[subset2$BsmtExposure == "Zero", "BsmtExposureN"] <- 0
+subset2[subset2$BsmtExposure == "No", "BsmtExposureN"] <- 1
+subset2[subset2$BsmtExposure == "Mn", "BsmtExposureN"] <- 2
+subset2[subset2$BsmtExposure == "Av", "BsmtExposureN"] <- 3
+subset2[subset2$BsmtExposure == "Gd", "BsmtExposureN"] <- 4
+
+subset2[subset2$BsmtFinType1 == "Zero", "BsmtFinType1N"] <- 0
+subset2[subset2$BsmtFinType1 == "Unf", "BsmtFinType1N"] <- 1
+subset2[subset2$BsmtFinType1 == "LwQ", "BsmtFinType1N"] <- 2
+subset2[subset2$BsmtFinType1 == "Rec", "BsmtFinType1N"] <- 3
+subset2[subset2$BsmtFinType1 == "BLQ", "BsmtFinType1N"] <- 4
+subset2[subset2$BsmtFinType1 == "ALQ", "BsmtFinType1N"] <- 5
+subset2[subset2$BsmtFinType1 == "GLQ", "BsmtFinType1N"] <- 6
+
+subset2[subset2$KitchenQual == "Po", "KitchenQualN"] <- 1
+subset2[subset2$KitchenQual == "Fa", "KitchenQualN"] <- 2
+subset2[subset2$KitchenQual == "TA", "KitchenQualN"] <- 3
+subset2[subset2$KitchenQual == "Gd", "KitchenQualN"] <- 4
+subset2[subset2$KitchenQual == "Ex", "KitchenQualN"] <- 5
+
+subset2[subset2$FireplaceQu == "Zero", "FireplaceQuN"] <- 0
+subset2[subset2$FireplaceQu == "Po", "FireplaceQuN"] <- 1
+subset2[subset2$FireplaceQu == "Fa", "FireplaceQuN"] <- 2
+subset2[subset2$FireplaceQu == "TA", "FireplaceQuN"] <- 3
+subset2[subset2$FireplaceQu == "Gd", "FireplaceQuN"] <- 4
+subset2[subset2$FireplaceQu == "Ex", "FireplaceQuN"] <- 5
+
+subset2$WithFireplace <- 0
+subset2[subset2$FireplaceQuN > 0, "WithFireplace"] <- 1
+
+subset2[subset2$GarageFinish == "Zero", "GarageFinishN"] <- 0
+subset2[subset2$GarageFinish == "Unf", "GarageFinishN"] <- 1
+subset2[subset2$GarageFinish == "RFn", "GarageFinishN"] <- 2
+subset2[subset2$GarageFinish == "Fin", "GarageFinishN"] <- 3
+
+subset2$WithGarage <- 0
+subset2[subset2$GarageFinishN > 0, "WithGarage"] <- 1
+
+subset2[subset2$Fence == "Zero", "FenceN"] <- 0
+subset2[subset2$Fence == "MnWw", "FenceN"] <- 1
+subset2[subset2$Fence == "GdWo", "FenceN"] <- 2
+subset2[subset2$Fence == "MnPrv", "FenceN"] <- 3
+subset2[subset2$Fence == "GdPrv", "FenceN"] <- 4
+
+subset2$WithFence <- 0
+subset2[subset2$FenceN > 0, "WithFence"] <- 1
+```
+
+```{r, include=FALSE}
+subset2 <- select(subset2, -c(names(subset2.factor)))
+str(subset2)
+```
+
+```{r, include=FALSE}
+# Combine the subsets of group 2
+subset_numeric <- cbind(subset1, select(subset2, -c("SalePrice", "AgeSoldGarage", "WithBsmt",
+                                                    "WithFireplace","WithGarage","WithFence")))
+str(subset_numeric)
+```
+
+```{r Correlation Heat Map, echo=FALSE, fig.height=4, fig.width=6}
+library(reshape2)
+library(ggplot2)
+cormat <- round(cor(subset_numeric),2)
+melted_cormat <- melt(cormat)
+# ggplot(data = melted_cormat, aes(x=Var1, y=Var2, fill=value)) + geom_tile()
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+}
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+}
+upper_tri <- get_upper_tri(cormat)
+melted_cormat2 <- melt(upper_tri, na.rm = TRUE)
+# Heatmap
+ggplot(data = melted_cormat2, aes(Var2, Var1, fill = value)) +
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "dodgerblue4", high = "red4", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal() + 
+ theme(axis.text.x = element_text(angle = 90, vjust = 1, 
+    size = 7, hjust = 1),axis.text.y = element_text( 
+    size = 7))+
+coord_fixed()
+```
+             
+* Figure 1. Heatmap of cross-correlation
+
+\pagebreak 
+
+whereas for the factor variables, we did ANOVA tests against house prices as below:
+
+```{r ANOVA test,echo=FALSE}
+aov1 = aov(SalePrice~., data = subset3)
+summary(aov1)
+```
+
+```{r Stacked Histograms, fig.width=10, fig.height=8, include=FALSE}
+# Plot the stacked histograms for numeric variables before and 
+# after logarithmic transformations
+
+#install.packages("ggplot2", dependencies = TRUE)
+library(ggridges)
+library(ggpubr)
+#par(mfrow=c(1,2))
+hist1 <- ggplot(stack(subset1), aes(x = values, y = ind, fill = ind)) +
+  geom_density_ridges() +
+  theme_ridges() + 
+  labs(title="Before Transformation")+
+  theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 6),
+        axis.text.y = element_text(size = 6))
+hist1_log <- ggplot(stack(subset1_log), aes(x = values, y = ind, fill = ind)) +
+  geom_density_ridges() +
+  theme_ridges() + 
+  labs(title="After Transformation")+
+  theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 6),
+  axis.text.y = element_text(size = 6))
+```
+
+A quick glance would tell us the house sale prices were highly relevant to OverallQual, ExterQualN, KitchenQualN, GrLivArea, TotalBsmtSF, BsmtQualN, 1stFlrSF, GarageArea, GarageCars, etc. (mostly positively correlated except for AgeSoldBuilt and GarageCars) among numeric variables and MSSubClass, Neighborhood, MSZoning, LotShape, MasVnrType, etc. among factor variables. Hence it’s reasonable to assume that these variables are valid candidates. We noticed that the distributions of SalePrice and the variables measuring areas were largely skewed, thus we performed a log-transformation (note: since values close to zero will result in aberrant negative values after log-transformation, we did $log(x+1)$ instead of $log(x)$) on them. The comparison of their distributions before and after the transformation is shown as below:
+
+```{r echo=FALSE, fig.height=4, fig.width=8, message=FALSE, warning=FALSE}
+# Arrange the graphs in parallel
+ggarrange(hist1, hist1_log, 
+          #labels = c("Before Transformation", "After Transformation"),
+          ncol = 2, nrow = 1)
+```
+
+* Figure 2. Histrogram of numeric features
+
+
+We noticed that there were big clusters of observations at zero value for logOpenPorchSF, logWoodDeckSF, log2nFlrSF, logBsmtFinSF1 and logMasVnrArea due to the lack of corresponding parts in those houses and required attention in the model building phase. 
+
+We were also interested in how the sale prices differ across different levels of the factor variables. Here we display the box plots for two of them:
+
+```{r Boxplots,echo=FALSE, fig.height=6, fig.width=10}
+# Draw boxplots for factor variables MSSubClass and Neighborhood
+# to see how HousePrice differ across different modalities
+MSSubClass <- ggboxplot(subset3, x = "MSSubClass", y = "SalePrice", 
+          color = "MSSubClass", 
+          #palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+          #order = c("ctrl", "trt1", "trt2"),
+          ylab = "SalePrice", xlab = "MSSubClass")+ theme(legend.position = 'none')
+Neighborhood <- ggboxplot(subset3, x = "Neighborhood", y = "SalePrice", 
+          color = "Neighborhood", 
+          #palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+          #order = c("ctrl", "trt1", "trt2"),
+          ylab = "SalePrice", xlab = "Neighborhood")+theme(axis.text.x =
+                                                             element_text(angle =
+                                                                            90,
+                                                                          vjust = 1,
+          size = 9, hjust = 1), legend.position = 'none')
+
+ggarrange(MSSubClass, Neighborhood, 
+          labels = c("MSSubClass", "Neighborhood"),
+          ncol = 1, nrow = 2)
+```
+* Figure 3. Boxplot Factors/SalePrice
+
+We can see SalePrice indeed has significant variations across different levels of these two variables. Thus they are reasonable predictors.
+
+```{r Data Aggregation,include=FALSE}
+# Aggregate the datasets
+train_agg <- cbind(subset1_log, select(subset2, -SalePrice), select(subset3, -SalePrice))
+train_agg <- select(train_agg, -AgeSoldGarage)
+str(train_agg)
+```
+
+
+**III. Modeling and Diagnostics**
+
+
+We started with multiple linear regression model. The relevant features were selected by conducting stepwise feature selection in both directions. We chose the model that yielded the smallest AIC. 
+
+```{r helper function to customize output of linear model, include=FALSE}
+# override output of summary(lm), We can choose to display a sublist of coefficients by specifying argument [my.rows], rather than the entire long list) 
+
+# ref: https://stackoverflow.com/questions/35388010/hide-some-coefficients-in-regression-summary-while-still-returning-call-r-squar
+
+my.summary.lm = function (x, digits = max(3L, getOption("digits") - 3L), 
+                       symbolic.cor = x$symbolic.cor, 
+                       signif.stars = getOption("show.signif.stars"), 
+                       my.rows, ...)                     # NOTE NEW my.rows ARGUMENT
+{
+  cat("\nCall:\n", paste(deparse(x$call), sep = "\n", collapse = "\n"), 
+      "\n\n", sep = "")
+  resid <- x$residuals
+  df <- x$df
+  rdf <- df[2L]
+  cat(if (!is.null(x$weights) && diff(range(x$weights))) 
+    "Weighted ", "Residuals:\n", sep = "")
+  if (rdf > 5L) {
+    nam <- c("Min", "1Q", "Median", "3Q", "Max")
+    rq <- if (length(dim(resid)) == 2L) 
+      structure(apply(t(resid), 1L, quantile), dimnames = list(nam, 
+                                                               dimnames(resid)[[2L]]))
+    else {
+      zz <- zapsmall(quantile(resid), digits + 1L)
+      structure(zz, names = nam)
+    }
+    print(rq, digits = digits, ...)
+  }
+  else if (rdf > 0L) {
+    print(resid, digits = digits, ...)
+  }
+  else {
+    cat("ALL", df[1L], "residuals are 0: no residual degrees of freedom!")
+    cat("\n")
+  }
+  if (length(x$aliased) == 0L) {
+    cat("\nNo Coefficients\n")
+  }
+  else {
+    if (nsingular <- df[3L] - df[1L]) 
+      cat("\nCoefficients: (", nsingular, " not defined because of singularities)\n", 
+          sep = "")
+    else cat("\nCoefficients:\n")
+    coefs <- x$coefficients[my.rows,]                      # SUBSET my.rows
+    if (!is.null(aliased <- x$aliased) && any(aliased)) {
+      cn <- names(aliased)
+      coefs <- matrix(NA, length(aliased), 4, dimnames = list(cn, 
+                                                              colnames(coefs)))
+      coefs[!aliased, ] <- x$coefficients
+    }
+    printCoefmat(coefs, digits = digits, signif.stars = signif.stars, 
+                 na.print = "NA", ...)
+  }
+  cat("\nResidual standard error:", format(signif(x$sigma, 
+                                                  digits)), "on", rdf, "degrees of freedom")
+  cat("\n")
+  if (nzchar(mess <- naprint(x$na.action))) 
+    cat("  (", mess, ")\n", sep = "")
+  if (!is.null(x$fstatistic)) {
+    cat("Multiple R-squared: ", formatC(x$r.squared, digits = digits))
+    cat(",\tAdjusted R-squared: ", formatC(x$adj.r.squared, 
+                                           digits = digits), "\nF-statistic:", formatC(x$fstatistic[1L], 
+                                                                                       digits = digits), "on", x$fstatistic[2L], "and", 
+        x$fstatistic[3L], "DF,  p-value:", format.pval(pf(x$fstatistic[1L], 
+                                                          x$fstatistic[2L], x$fstatistic[3L], lower.tail = FALSE), 
+                                                       digits = digits))
+    cat("\n")
+  }
+  correl <- x$correlation
+  if (!is.null(correl)) {
+    p <- NCOL(correl)
+    if (p > 1L) {
+      cat("\nCorrelation of Coefficients:\n")
+      if (is.logical(symbolic.cor) && symbolic.cor) {
+        print(symnum(correl, abbr.colnames = NULL))
+      }
+      else {
+        correl <- format(round(correl, 2), nsmall = 2, 
+                         digits = digits)
+        correl[!lower.tri(correl)] <- ""
+        print(correl[-1, -p, drop = FALSE], quote = FALSE)
+      }
+    }
+  }
+  cat("\n")
+  invisible(x)
+}
+```
+
+```{r First linear regression model with stepwise feature selection, echo=FALSE}
+modelA <- lm(logSalePrice ~ logLotFrontage+logLotArea+logMasVnrArea+logBsmtFinSF1+logBsmtUnfSF
+             +logTotalBsmtSF+log1stFlrSF+log2ndFlrSF+logGrLivArea+logGarageArea+logWoodDeckSF
+             +logOpenPorchSF+OverallQual+OverallCond+BsmtFullBath+FullBath+HalfBath+BedroomAbvGr
+             +TotRmsAbvGrd+Fireplaces+GarageCars+AgeSoldBuilt+AgeSoldRemod
+             +ExterQualN+ExterCondN+WithBsmt*BsmtQualN+WithBsmt*BsmtExposureN+WithBsmt*BsmtFinType1N+KitchenQualN
+             +WithFireplace*FireplaceQuN+WithGarage*GarageFinishN+WithFence*FenceN
+             +MoSold+MSSubClass+MSZoning+LotShape+LotConfig+Neighborhood+HouseStyle
+             +RoofStyle+Exterior1st+Exterior2nd+MasVnrType+Foundation+HeatingQC+GarageType
+               , data = train_agg)
+
+select.variables.both = step(modelA, scope= ~1, direction="both", trace=FALSE)
+my.summary.lm(summary(select.variables.both), my.rows = 0)
+```
+Note that we didn't print the coefficients here but only provided the model instead.
+
+As mentioned, we have transformed features describing quality and condition into ordinal and left those without ordinality as they were. The model consisted of 26 features, though with one-hot coding there appeared to be 93 in total. The model took in a factor as long as one modality is significant. For reference, we conducted LASSO regression (with one-hot coding) with penalization on the number of features and obtained another set of 68 features which yielded the optimal RMSE. The resulted feature sets were roughly the same for ordinary linear model and for LASSO except that the irrelevant modelatities were removed in Lasso. The LASSO model was thus more compact. 
+
+From the diagnostic plots and related hypothesis tests below we observed immediately that while Postulate 1 and 3 were satisfied, 2 (constant-variance errors) and 4 (gaussian errors) did not hold because of a few atypical points. We thus used hat value, cook's distance and Bonferroni p-value to identify atypical observations and to decide whether to remove these points.
+
+```{r Diagnostic plots, echo=FALSE}
+par(mfrow=c(2,2))
+plot(select.variables.both)
+```
+
+* Figure 4a. Diagnostic plots of our first model(I)
+```{r Hypothesis testing P2-P4, echo=FALSE}
+ncvTest(select.variables.both)
+durbinWatsonTest(select.variables.both)
+shapiro.test(residuals((select.variables.both)))
+```
+
+```{r OutlierTest1, echo=FALSE, fig.height=6, fig.width=8}
+influenceIndexPlot(select.variables.both,vars=c("Cook", "Studentized", "hat"))
+
+```
+* Figure 4b. Diagnostic plots of our first model(II)
+```{r OutlierTest2, echo=FALSE}
+outlierTest(select.variables.both)
+```
+
+We removed all the outliers with Bonferroni p-value lower than 0.05. Some of them, though being outliers, didn’t have strong leverage effect and didn’t necessarily need to be removed. Nevertheless, we chose to remove the outliers in a proactive way to make data cleaner. After the removal of these atypical observations we saw that P2 was satisfied and the adjusted R-square raised significantly.  
+
+```{r Linear regression with outliers removed, echo=FALSE}
+FModel <- lm(formula = logSalePrice ~ logLotArea + logBsmtFinSF1 + logBsmtUnfSF + 
+    logTotalBsmtSF + logGrLivArea + logWoodDeckSF + OverallQual + 
+    OverallCond + BsmtFullBath + FullBath + HalfBath + GarageCars + 
+    AgeSoldBuilt + AgeSoldRemod + WithBsmt + BsmtQualN + BsmtExposureN + 
+    KitchenQualN + FireplaceQuN + GarageFinishN + WithFence + 
+    FenceN + MSSubClass + MSZoning + LotShape + LotConfig + Neighborhood + 
+    Exterior1st + MasVnrType + Foundation + HeatingQC, data = train_agg[-c(31, 326, 411, 463, 496,         524, 589, 633, 813, 875, 969,
+        1001, 1012, 1072, 1188, 1299, 1325, 1371, 1454),])
+```
+
+```{r Hypothesis testing P2, echo=FALSE}
+ncvTest(FModel)
+shapiro.test(residuals((FModel)))
+```
+
+However, P4 was still not satisfied even after we removed all the outliers. We tried transforming features in other way or filtering out features more aggressively, but none of them worked. Then we performed normality test on the response variable SalePrice and its logarithmic form and found neither of them to be gaussian. We considered this issue as an innate feature of house prices and decided to ignore it as it wouldn't violate the validity of OLSE estimates.
+
+```{r QQ-plot of response variable and logarithmic response variable, echo=FALSE, fig.height=4, fig.width=8}
+library(gridExtra)
+p1 <- ggplot(subset1, aes(sample = SalePrice)) + 
+  stat_qq() + stat_qq_line() + ggtitle("SalePrice")
+p2 <- ggplot(subset1_log, aes(sample = logSalePrice)) + 
+  stat_qq() + stat_qq_line() + ggtitle("logSalePrice")
+grid.arrange(p1, p2)
+```
+* Figure 5. QQ-plot of response variable SalePrice & logSalePrice
+
+**V. Final Models**
+
+We obtained our final compact model after hand-crafting features, shrinking model and removing atypical observations. We found 25 features in total to be relevant to house prices. Among them were the areas of different parts of a house (logLotArea, logBsmtFinSF1, logTotalBsmtSF, logGrLivArea, GarageCars), the number and conditions of facilities (BsmtFullBath, FullBath, HalfBath, WithBsmt, BsmtQualN, BsmtExposureN, KitchenQualN, FireplaceQuN, HeatingQC), the overall conditions of the house (OverallQual, OverallCond, AgeSoldBuilt, MSSubClass, MSZoning, LotShape, LotConfig, Exterior1st, MasVnrType, Foundation) and types of their neighborhoods. We also removed 19 atypical observations to satisfy the constant-variance error assumption.
+
+```{r Final Model, echo=FALSE}
+printCoeff = c(1,2,3,5,6,8,9,10,12,13,14,16,17,18,19,20,
+        33,35,37,38,39,40,41,69,73,83,85)
+my.summary.lm(summary(FModel), my.rows = printCoeff)
+```
+Note that due to page limit we only displayed highly significant results (with p-value < 0.001).
+
+With the log model, coefficients should be interpreted in terms of percent change in HousePrice. We know from above that a 1% increase in GrLivArea is associated with a 0.38% increase in HousePrice. Coefficients for other logarithmic variables can be interpreted similarly. Having a basement, however, is associated with a 0.7% decrease. Judging from the coefficients, we can see that these two variables along with MSZoning, NeighborhoodStoneBr, etc. are the key drivers of sale prices.
+
+To measure the prediction accuracy of our model, we also calculated three major metrics of regression after performing 10 fold cross-validation. We can see our final model has quite robust performance.
+
+```{r Cross-Validation, echo=FALSE}
+library(tidyverse)
+library(caret)
+
+# Define training control
+set.seed(42)
+train.control <- trainControl(method = "repeatedcv", 
+                              number = 10, repeats = 3)
+# Train the model
+cvmodel <- train(logSalePrice ~ logLotArea + logBsmtFinSF1 + logBsmtUnfSF + 
+    logTotalBsmtSF + logGrLivArea + logWoodDeckSF + OverallQual + 
+    OverallCond + BsmtFullBath + FullBath + HalfBath + GarageCars + 
+    AgeSoldBuilt + AgeSoldRemod + WithBsmt + BsmtQualN + BsmtExposureN + 
+    KitchenQualN + FireplaceQuN + GarageFinishN + WithFence + 
+    FenceN + MSSubClass + MSZoning + LotShape + LotConfig + Neighborhood + 
+    Exterior1st + MasVnrType + Foundation + HeatingQC, data = train_agg[-c(31, 
+    326, 411, 463, 496, 524, 589, 633, 813, 875, 969, 1001, 1012, 
+    1072, 1188, 1299, 1325, 1371, 1454),], method = "lm",
+               trControl = train.control)
+# Summarize the results
+print(cvmodel)
+```
+ 
+We've also tested our model on the test set provided by Kaggle and got Root Mean Squared Logarithmic Error of 0.12486. 
+ 
+ 
+**VI. Discussions**
+
+One major issue detected in our model was that the gaussian error assumption did not hold. Although it didn’t falsify our estimates of the coefficients, it indeed invalidated the confidence intervals and p-values. We noticed that it was probably due to the non-gaussianity of the response variable. Perhaps other transformations than logarithmic need to be done to fix this issue, or we should filter observations more aggressively, i.e. to remove more observations until the subset become normally distributed. By doing this we take the risk of overfitting. We`ve already extended features by hand-crafting or encoding, if we further subsample observations, the full-rank assumption may not hold any more. 
+
+```{r Preparing dataset with onehot encoding, include=FALSE}
+library(data.table)
+library(mltools)
+library(glmnet)
+train_agg_onehot <- one_hot(as.data.table(train_agg))
+train_agg_onehot = train_agg_onehot[-c(31, 326, 411, 463, 496, 524,
+             589, 633, 813, 875, 969,
+            1001, 1012, 1072, 1188, 1299, 1325, 1371, 1454),]
+```
+
+```{r eval=FALSE, include=FALSE}
+modelC = lm(formula = logSalePrice ~. , data = train_agg_onehot)
+select.variables.bothC = step(modelC, scope= ~1, direction="both", trace=FALSE)
+my.summary.lm(summary(select.variables.bothC), my.rows = 0)
+```
+```{r eval=FALSE, include=FALSE}
+# Define training control
+set.seed(42)
+train.control <- trainControl(method = "repeatedcv", 
+                              number = 10, repeats = 3)
+# Train the model
+cvmodel2 <- train(logSalePrice ~ logLotArea + logBsmtFinSF1 + logBsmtUnfSF + 
+    logTotalBsmtSF + log2ndFlrSF + logGrLivArea + logGarageArea + 
+    logWoodDeckSF + OverallQual + OverallCond + BsmtFullBath + 
+    FullBath + HalfBath + BedroomAbvGr + Fireplaces + GarageCars + 
+    AgeSoldBuilt + AgeSoldRemod + BsmtQualN + BsmtExposureN + 
+    KitchenQualN + WithBsmt + WithGarage + MoSold_5 + MoSold_6 + 
+    MoSold_7 + MSSubClass_20 + MSSubClass_50 + MSSubClass_60 + 
+    MSSubClass_70 + MSSubClass_75 + MSSubClass_90 + MSSubClass_120 + 
+    `MSZoning_C (all)` + MSZoning_FV + MSZoning_RH + MSZoning_RL + 
+    LotShape_IR1 + LotConfig_FR2 + LotConfig_FR3 + Neighborhood_BrkSide + 
+    Neighborhood_CollgCr + Neighborhood_Crawfor + Neighborhood_Edwards + 
+    Neighborhood_Gilbert + Neighborhood_MeadowV + Neighborhood_Mitchel + 
+    Neighborhood_NAmes + Neighborhood_NoRidge + Neighborhood_NridgHt + 
+    Neighborhood_NWAmes + Neighborhood_OldTown + Neighborhood_Sawyer + 
+    Neighborhood_SawyerW + Neighborhood_StoneBr + Neighborhood_Timber + 
+    HouseStyle_1.5Fin + HouseStyle_1Story + HouseStyle_2.5Fin + 
+    HouseStyle_2.5Unf + HouseStyle_2Story + RoofStyle_Hip + Exterior1st_BrkFace + 
+    Exterior1st_Stucco + `Exterior1st_Wd Sdng` + `Exterior2nd_Brk Cmn` + 
+    Exterior2nd_CmentBd + Exterior2nd_MetalSd + Exterior2nd_VinylSd + 
+    `Exterior2nd_Wd Sdng` + MasVnrType_BrkCmn + MasVnrType_BrkFace + 
+    MasVnrType_None + Foundation_BrkTil + Foundation_CBlock + 
+    Foundation_PConc + Foundation_Slab + Foundation_Stone + HeatingQC_Ex + 
+    HeatingQC_Fa + GarageType_2Types + GarageType_CarPort, data = train_agg_onehot, method = "lm",
+               trControl = train.control)
+# Summarize the results
+print(cvmodel2)
+```
+
+We also tried a linear regression model with elastic-net penalty with the help of glmnet package. The elastic-net penalty is a hybrid of L1 and L2 penalties, the objective function with which is given by $$argmin_{(\beta_0,\beta)\in\mathbb{R}^{p+1}}\frac{1}{2N}\sum^N_{i=1}(y_i-\beta_0-x_i^T\beta)^2+\lambda[(1-\gamma)||\beta||^2_2/2+\gamma||\beta||_1]$$. 
+The model with elastic-net penalty is therefore supposed to be more conservative and more compact. Glmnet can automatically fine-tune the hyperparameters such as overall penalty (lambda) and trade-off between L1 and L2 penalties (gamma).
+
+```{r Elastic-net (penalized) regression, echo=FALSE, fig.height=4, fig.width=8}
+cvfit = cv.glmnet(scale(as.matrix(train_agg_onehot[,-1]),
+                        center = TRUE, scale = FALSE),train_agg_onehot[[1]],
+                  relax = TRUE,
+                  nfolds = 10,
+                  type.measure = "mse")
+plot(cvfit)
+```
+* Figure 6. Plot of cross-validation MSE against penalization lambda
+
+The plot above suggested that a grid search into parameter space (lambda + gamma) was performed and the combination yielding the lowest cross-validation MSE was chosen. The corresponding RMSE is 0.1291, which is significantly higher than that of linear model, but the penalized model was more compact with 51 regressors and should be thus more robust against overfitting. 
+
+Given more time, we would like to experiment with kernel-based regression. Feature engineering is a fascinating field and can be greatly beneficial for improving model performance. We can find useful feature interactions by investigating descriptive statistics and then represent them by creating hand-crafted features. But it requires expertise in feature engineering and insights into the real estate industry. The kernel which maps features from its original space into an extended space with higher dimension can be helpful for exploitation of useful feature interactions. 
+
+
+
+
+
+
+
